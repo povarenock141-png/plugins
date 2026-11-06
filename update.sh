@@ -2,9 +2,9 @@
 # Обновить сервер ТВ без смены адреса туннеля.
 set -e
 cd ~/tvhub
-curl -fsSL https://raw.githubusercontent.com/povarenock141-png/plugins/tv-hub/server.js -o server.js.new
-node --check server.js.new
-mv server.js.new server.js
+curl -fsSL https://raw.githubusercontent.com/povarenock141-png/plugins/tv-hub/server.js -o server.new.js
+node --check server.new.js
+mv server.new.js server.js
 pkill -f 'tvhub/server.js' 2>/dev/null || true
 sleep 1
 nohup node ~/tvhub/server.js > ~/tvhub/node.out 2>&1 &

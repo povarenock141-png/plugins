@@ -82,8 +82,10 @@ const TOOLS = [
       return txt('ТВ ' + TV + ' на связи\n' + f + '\n' + p); } },
   { name: 'tv_screenshot', description: 'Снимок экрана ТВ. Видео с защитой (DRM) может выйти чёрным.',
     inputSchema: { type: 'object', properties: {} },
-    run: async () => { const png = await adb(['exec-out', 'screencap', '-p'], true);
-      if (!png || png.length < 100) throw new Error('пустой снимок');
+    run: async () => { let png = await adb(['exec-out', 'screencap', '-p'], true);
+      const at = png ? png.indexOf(Buffer.from([0x89, 0x50, 0x4e, 0x47])) : -1; // Hisense пишет мусор перед PNG
+      if (at < 0) throw new Error('ТВ не отдал снимок');
+      png = png.subarray(at);
       const tin = path.join(os.tmpdir(), 'tvshot.png'), tout = path.join(os.tmpdir(), 'tvshot.jpg');
       fs.writeFileSync(tin, png);
       for (const bin of ['magick', 'convert']) {
@@ -104,7 +106,7 @@ async function handle(m) {
   const p = m.params || {};
   switch (m.method) {
     case 'initialize': return ok({ protocolVersion: typeof p.protocolVersion === 'string' ? p.protocolVersion : '2025-06-18',
-      capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'tv-hub', version: '1.0.0' }, instructions: INSTR });
+      capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'tv-hub', version: '1.0.1' }, instructions: INSTR });
     case 'ping': return ok({});
     case 'tools/list': return ok({ tools: TOOLS.map(({ run, ...t }) => t) });
     case 'tools/call': {

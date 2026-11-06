@@ -6,3 +6,7 @@
 Установка в Termux:
 
     curl -fsSL https://raw.githubusercontent.com/povarenock141-png/plugins/tv-hub/setup.sh -o ~/tvsetup.sh && bash ~/tvsetup.sh
+
+Обновление сервера (адрес туннеля не меняется):
+
+    curl -fsSL https://raw.githubusercontent.com/povarenock141-png/plugins/tv-hub/update.sh -o ~/tvupdate.sh && bash ~/tvupdate.sh

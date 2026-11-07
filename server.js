@@ -137,7 +137,7 @@ async function handle(m) {
   const p = m.params || {};
   switch (m.method) {
     case 'initialize': return ok({ protocolVersion: typeof p.protocolVersion === 'string' ? p.protocolVersion : '2025-06-18',
-      capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'tv-hub', version: '1.2.0' }, instructions: INSTR });
+      capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'tv-hub', version: '1.3.0' }, instructions: INSTR });
     case 'ping': return ok({});
     case 'tools/list': return ok({ tools: TOOLS.map(({ run, ...t }) => t) });
     case 'tools/call': {
@@ -196,13 +196,16 @@ async function oauth(req, res, parts, base) {
   return false;
 }
 
+const baseOf = req => { const h = String(req.headers['x-forwarded-host'] || req.headers.host || 'localhost');
+  const pr = String(req.headers['x-forwarded-proto'] || (/^(127\.0\.0\.1|localhost)(:|$)/.test(h) ? 'http' : 'https')).split(',')[0].trim();
+  return pr + '://' + h; };
 const reqLog = [];
 http.createServer(async (req, res) => {
   const t0 = Date.now(), masked = String(req.url).split(TOKEN).join('***');
   let rpc = '';
   res.on('finish', () => {
     const line = new Date().toISOString() + ' ' + req.method + ' ' + masked + ' ' + rpc + ' -> ' + res.statusCode + ' ' +
-      (Date.now() - t0) + 'ms ua=' + String(req.headers['user-agent'] || '-').slice(0, 60) + ' accept=' + String(req.headers.accept || '-').slice(0, 50);
+      (Date.now() - t0) + 'ms auth=' + (req.headers.authorization ? 'Y' : 'N') + ' ua=' + String(req.headers['user-agent'] || '-').slice(0, 60) + ' accept=' + String(req.headers.accept || '-').slice(0, 50);
     reqLog.push(line); if (reqLog.length > 200) reqLog.shift(); log('req', line);
   });
   const parts = new URL(req.url, 'http://x').pathname.split('/').filter(Boolean);
@@ -211,9 +214,16 @@ http.createServer(async (req, res) => {
   const byPath = parts.length === 2 && parts[0] === TOKEN && parts[1] === 'mcp';
   const byHeader = parts.length === 1 && parts[0] === 'mcp' && req.headers.authorization === 'Bearer ' + TOKEN;
   if (!byPath && !byHeader) {
-    const base = 'https://' + String(req.headers['x-forwarded-host'] || req.headers.host || 'localhost');
+    const base = baseOf(req);
     try { if (await oauth(req, res, parts, base)) return; } catch (e) { log('oauth ERR', e.message); }
     res.writeHead(404); return res.end();
+  }
+  // Стандарт MCP: без Bearer-токена — 401 с адресом метаданных; клиент проходит OAuth и повторяет запрос с токеном.
+  if (byPath && !/^Bearer\s+\S+/i.test(String(req.headers.authorization || ''))) {
+    const base = baseOf(req);
+    res.writeHead(401, { 'Content-Type': 'application/json',
+      'WWW-Authenticate': 'Bearer realm="tv-hub", resource_metadata="' + base + '/.well-known/oauth-protected-resource/' + TOKEN + '/mcp"' });
+    return res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32001, message: 'Unauthorized' } }));
   }
   if (req.method === 'DELETE') { res.writeHead(204); return res.end(); }
   if (req.method !== 'POST') { res.writeHead(405, { Allow: 'POST' }); return res.end(); }

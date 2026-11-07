@@ -141,7 +141,7 @@ async function handle(m) {
   const p = m.params || {};
   switch (m.method) {
     case 'initialize': return ok({ protocolVersion: typeof p.protocolVersion === 'string' ? p.protocolVersion : '2025-06-18',
-      capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'tv-hub', version: '1.1.1' }, instructions: INSTR });
+      capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'tv-hub', version: '1.3.0' }, instructions: INSTR });
     case 'ping': return ok({});
     case 'tools/list': return ok({ tools: TOOLS.map(({ run, ...t }) => t) });
     case 'tools/call': {
@@ -155,11 +155,80 @@ async function handle(m) {
   }
 }
 
-http.createServer((req, res) => {
+// --- Упрощённый OAuth для коннектора Claude: всё одобряется автоматически. Доступ к ТВ всё равно
+// только по секретному ключу в адресе (/<ключ>/mcp), выданные OAuth-токены сами по себе ничего не открывают.
+const crypto = require('crypto');
+const rnd = () => crypto.randomBytes(24).toString('hex');
+const b64u = b => b.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const codes = new Map();
+const OK_REDIRECT = /^https:\/\/([a-z0-9-]+\.)*(claude\.ai|claude\.com|anthropic\.com)(\/|$)/i;
+const sendJson = (res, code, obj, extra = {}) => { res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...extra }); res.end(JSON.stringify(obj)); };
+const readBody = req => new Promise(r => { let b = ''; req.on('data', c => { b += c; if (b.length > 1e5) req.destroy(); }); req.on('end', () => r(b)); });
+const parseBody = (b, type) => { try { return /json/.test(type || '') ? JSON.parse(b) : Object.fromEntries(new URLSearchParams(b)); } catch (e) { return {}; } };
+async function oauth(req, res, parts, base) {
+  const p = '/' + parts.join('/');
+  if (p === '/.well-known/oauth-protected-resource/' + TOKEN + '/mcp') // только с ключом в пути: ключ не утекает
+    return sendJson(res, 200, { resource: base + '/' + TOKEN + '/mcp', authorization_servers: [base], bearer_methods_supported: ['header'], scopes_supported: ['tv'] }), true;
+  if (p === '/.well-known/oauth-authorization-server' || p === '/.well-known/openid-configuration')
+    return sendJson(res, 200, { issuer: base, authorization_endpoint: base + '/authorize', token_endpoint: base + '/token',
+      registration_endpoint: base + '/register', response_types_supported: ['code'], grant_types_supported: ['authorization_code', 'refresh_token'],
+      code_challenge_methods_supported: ['S256'], token_endpoint_auth_methods_supported: ['none', 'client_secret_post', 'client_secret_basic'],
+      scopes_supported: ['tv'] }), true;
+  if (p === '/register' && req.method === 'POST') {
+    const b = parseBody(await readBody(req), req.headers['content-type']);
+    return sendJson(res, 201, { client_id: rnd(), client_id_issued_at: Math.floor(Date.now() / 1000), client_name: b.client_name || 'claude',
+      redirect_uris: b.redirect_uris || [], grant_types: ['authorization_code', 'refresh_token'], response_types: ['code'],
+      token_endpoint_auth_method: 'none' }), true;
+  }
+  if (p === '/authorize' && req.method === 'GET') {
+    const q = new URL(req.url, base).searchParams, ru = q.get('redirect_uri') || '';
+    if (!OK_REDIRECT.test(ru)) { res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('redirect_uri not allowed'); return true; }
+    const code = rnd(); codes.set(code, { ch: q.get('code_challenge'), m: q.get('code_challenge_method') || 'plain', exp: Date.now() + 300000 });
+    const loc = new URL(ru); loc.searchParams.set('code', code); if (q.get('state')) loc.searchParams.set('state', q.get('state'));
+    res.writeHead(302, { Location: loc.toString() }); res.end(); return true;
+  }
+  if (p === '/token' && req.method === 'POST') {
+    const b = parseBody(await readBody(req), req.headers['content-type']);
+    if (b.grant_type === 'authorization_code') {
+      const c = codes.get(b.code); codes.delete(b.code);
+      if (!c || c.exp < Date.now()) return sendJson(res, 400, { error: 'invalid_grant' }), true;
+      if (c.ch) { const v = String(b.code_verifier || ''); const calc = c.m === 'S256' ? b64u(crypto.createHash('sha256').update(v).digest()) : v;
+        if (calc !== c.ch) return sendJson(res, 400, { error: 'invalid_grant', error_description: 'PKCE' }), true; }
+    } else if (b.grant_type !== 'refresh_token') return sendJson(res, 400, { error: 'unsupported_grant_type' }), true;
+    return sendJson(res, 200, { access_token: rnd(), token_type: 'Bearer', expires_in: 31536000, refresh_token: rnd(), scope: 'tv' }), true;
+  }
+  return false;
+}
+
+const baseOf = req => { const h = String(req.headers['x-forwarded-host'] || req.headers.host || 'localhost');
+  const pr = String(req.headers['x-forwarded-proto'] || (/^(127\.0\.0\.1|localhost)(:|$)/.test(h) ? 'http' : 'https')).split(',')[0].trim();
+  return pr + '://' + h; };
+const reqLog = [];
+http.createServer(async (req, res) => {
+  const t0 = Date.now(), masked = String(req.url).split(TOKEN).join('***');
+  let rpc = '';
+  res.on('finish', () => {
+    const line = new Date().toISOString() + ' ' + req.method + ' ' + masked + ' ' + rpc + ' -> ' + res.statusCode + ' ' +
+      (Date.now() - t0) + 'ms auth=' + (req.headers.authorization ? 'Y' : 'N') + ' ua=' + String(req.headers['user-agent'] || '-').slice(0, 60) + ' accept=' + String(req.headers.accept || '-').slice(0, 50);
+    reqLog.push(line); if (reqLog.length > 200) reqLog.shift(); log('req', line);
+  });
   const parts = new URL(req.url, 'http://x').pathname.split('/').filter(Boolean);
+  if (req.method === 'GET' && parts.length === 2 && parts[0] === TOKEN && parts[1] === 'log') {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end(reqLog.slice(-80).join('\n') + '\n'); }
   const byPath = parts.length === 2 && parts[0] === TOKEN && parts[1] === 'mcp';
   const byHeader = parts.length === 1 && parts[0] === 'mcp' && req.headers.authorization === 'Bearer ' + TOKEN;
-  if (!byPath && !byHeader) { res.writeHead(404); return res.end(); }
+  if (!byPath && !byHeader) {
+    const base = baseOf(req);
+    try { if (await oauth(req, res, parts, base)) return; } catch (e) { log('oauth ERR', e.message); }
+    res.writeHead(404); return res.end();
+  }
+  // Стандарт MCP: без Bearer-токена — 401 с адресом метаданных; клиент проходит OAuth и повторяет запрос с токеном.
+  if (byPath && !/^Bearer\s+\S+/i.test(String(req.headers.authorization || ''))) {
+    const base = baseOf(req);
+    res.writeHead(401, { 'Content-Type': 'application/json',
+      'WWW-Authenticate': 'Bearer realm="tv-hub", resource_metadata="' + base + '/.well-known/oauth-protected-resource/' + TOKEN + '/mcp"' });
+    return res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32001, message: 'Unauthorized' } }));
+  }
   if (req.method === 'DELETE') { res.writeHead(204); return res.end(); }
   if (req.method !== 'POST') { res.writeHead(405, { Allow: 'POST' }); return res.end(); }
   let body = '';
@@ -170,6 +239,7 @@ http.createServer((req, res) => {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }));
     }
+    rpc = [].concat(msg).map(m => (m && m.method) || '?').join(',') + ([].concat(msg)[0] && [].concat(msg)[0].params && [].concat(msg)[0].params.protocolVersion ? '(' + [].concat(msg)[0].params.protocolVersion + ')' : '');
     const out = Array.isArray(msg) ? (await Promise.all(msg.map(handle))).filter(Boolean) : await handle(msg);
     if (!out || (Array.isArray(out) && !out.length)) { res.writeHead(202); return res.end(); }
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -198,7 +268,7 @@ for i in $(seq 1 45); do
 done
 sleep 1
 T=$(cat ~/tvhub/token)
-R=$(curl -s -X POST "http://127.0.0.1:8787/$T/mcp" -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tv_status","arguments":{}}}')
+R=$(curl -s -X POST "http://127.0.0.1:8787/$T/mcp" -H 'content-type: application/json' -H 'Authorization: Bearer local' -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tv_status","arguments":{}}}')
 echo
 if echo "$R" | grep -q 'на связи'; then echo "ТВ: на связи"; else echo "ТВ: НЕ ответил -> $R"; fi
 if [ -n "$U" ]; then

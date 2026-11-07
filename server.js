@@ -84,10 +84,12 @@ const TOOLS = [
   { name: 'tv_open_app', description: 'Открыть приложение на ТВ по имени пакета (из tv_list_apps). Например org.smarttube.stable — SmartTube.',
     inputSchema: { type: 'object', properties: { package: { type: 'string' } }, required: ['package'] },
     run: async a => { if (!PKG.test(a.package || '')) throw new Error('неверное имя пакета');
-      let out = await sh('monkey -p ' + q(a.package) + ' -c android.intent.category.LEANBACK_LAUNCHER 1 2>&1');
-      if (/No activities found|aborted/i.test(out)) out = await sh('monkey -p ' + q(a.package) + ' -c android.intent.category.LAUNCHER 1 2>&1');
-      if (/No activities found|aborted/i.test(out)) throw new Error('не удалось открыть ' + a.package);
-      return txt('открыто: ' + a.package); } },
+      for (const cat of ['LEANBACK_LAUNCHER', 'LAUNCHER']) {
+        let out; try { out = await sh('monkey -p ' + q(a.package) + ' -c android.intent.category.' + cat + ' 1 2>&1'); }
+        catch (e) { out = String(e.message); }
+        if (/Events injected: 1/.test(out)) return txt('открыто: ' + a.package);
+      }
+      throw new Error('не удалось открыть ' + a.package); } },
   { name: 'tv_open_url', description: 'Открыть ссылку на ТВ (видео VK, YouTube и т.п.). Можно указать пакет приложения, в котором открыть.',
     inputSchema: { type: 'object', properties: { url: { type: 'string' }, package: { type: 'string' } }, required: ['url'] },
     run: async a => { const u = String(a.url || '');
@@ -135,7 +137,7 @@ async function handle(m) {
   const p = m.params || {};
   switch (m.method) {
     case 'initialize': return ok({ protocolVersion: typeof p.protocolVersion === 'string' ? p.protocolVersion : '2025-06-18',
-      capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'tv-hub', version: '1.1.0' }, instructions: INSTR });
+      capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'tv-hub', version: '1.1.1' }, instructions: INSTR });
     case 'ping': return ok({});
     case 'tools/list': return ok({ tools: TOOLS.map(({ run, ...t }) => t) });
     case 'tools/call': {

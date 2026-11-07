@@ -137,7 +137,7 @@ async function handle(m) {
   const p = m.params || {};
   switch (m.method) {
     case 'initialize': return ok({ protocolVersion: typeof p.protocolVersion === 'string' ? p.protocolVersion : '2025-06-18',
-      capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'tv-hub', version: '1.1.1' }, instructions: INSTR });
+      capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'tv-hub', version: '1.1.2' }, instructions: INSTR });
     case 'ping': return ok({});
     case 'tools/list': return ok({ tools: TOOLS.map(({ run, ...t }) => t) });
     case 'tools/call': {
@@ -151,8 +151,18 @@ async function handle(m) {
   }
 }
 
+const reqLog = [];
 http.createServer((req, res) => {
+  const t0 = Date.now(), masked = String(req.url).split(TOKEN).join('***');
+  let rpc = '';
+  res.on('finish', () => {
+    const line = new Date().toISOString() + ' ' + req.method + ' ' + masked + ' ' + rpc + ' -> ' + res.statusCode + ' ' +
+      (Date.now() - t0) + 'ms ua=' + String(req.headers['user-agent'] || '-').slice(0, 60) + ' accept=' + String(req.headers.accept || '-').slice(0, 50);
+    reqLog.push(line); if (reqLog.length > 200) reqLog.shift(); log('req', line);
+  });
   const parts = new URL(req.url, 'http://x').pathname.split('/').filter(Boolean);
+  if (req.method === 'GET' && parts.length === 2 && parts[0] === TOKEN && parts[1] === 'log') {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end(reqLog.slice(-80).join('\n') + '\n'); }
   const byPath = parts.length === 2 && parts[0] === TOKEN && parts[1] === 'mcp';
   const byHeader = parts.length === 1 && parts[0] === 'mcp' && req.headers.authorization === 'Bearer ' + TOKEN;
   if (!byPath && !byHeader) { res.writeHead(404); return res.end(); }
@@ -166,6 +176,7 @@ http.createServer((req, res) => {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }));
     }
+    rpc = [].concat(msg).map(m => (m && m.method) || '?').join(',') + ([].concat(msg)[0] && [].concat(msg)[0].params && [].concat(msg)[0].params.protocolVersion ? '(' + [].concat(msg)[0].params.protocolVersion + ')' : '');
     const out = Array.isArray(msg) ? (await Promise.all(msg.map(handle))).filter(Boolean) : await handle(msg);
     if (!out || (Array.isArray(out) && !out.length)) { res.writeHead(202); return res.end(); }
     res.writeHead(200, { 'Content-Type': 'application/json' });

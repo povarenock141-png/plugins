@@ -137,7 +137,7 @@ async function handle(m) {
   const p = m.params || {};
   switch (m.method) {
     case 'initialize': return ok({ protocolVersion: typeof p.protocolVersion === 'string' ? p.protocolVersion : '2025-06-18',
-      capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'tv-hub', version: '1.1.2' }, instructions: INSTR });
+      capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'tv-hub', version: '1.2.0' }, instructions: INSTR });
     case 'ping': return ok({});
     case 'tools/list': return ok({ tools: TOOLS.map(({ run, ...t }) => t) });
     case 'tools/call': {
@@ -151,8 +151,53 @@ async function handle(m) {
   }
 }
 
+// --- Упрощённый OAuth для коннектора Claude: всё одобряется автоматически. Доступ к ТВ всё равно
+// только по секретному ключу в адресе (/<ключ>/mcp), выданные OAuth-токены сами по себе ничего не открывают.
+const crypto = require('crypto');
+const rnd = () => crypto.randomBytes(24).toString('hex');
+const b64u = b => b.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const codes = new Map();
+const OK_REDIRECT = /^https:\/\/([a-z0-9-]+\.)*(claude\.ai|claude\.com|anthropic\.com)(\/|$)/i;
+const sendJson = (res, code, obj, extra = {}) => { res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...extra }); res.end(JSON.stringify(obj)); };
+const readBody = req => new Promise(r => { let b = ''; req.on('data', c => { b += c; if (b.length > 1e5) req.destroy(); }); req.on('end', () => r(b)); });
+const parseBody = (b, type) => { try { return /json/.test(type || '') ? JSON.parse(b) : Object.fromEntries(new URLSearchParams(b)); } catch (e) { return {}; } };
+async function oauth(req, res, parts, base) {
+  const p = '/' + parts.join('/');
+  if (p === '/.well-known/oauth-protected-resource/' + TOKEN + '/mcp') // только с ключом в пути: ключ не утекает
+    return sendJson(res, 200, { resource: base + '/' + TOKEN + '/mcp', authorization_servers: [base], bearer_methods_supported: ['header'], scopes_supported: ['tv'] }), true;
+  if (p === '/.well-known/oauth-authorization-server' || p === '/.well-known/openid-configuration')
+    return sendJson(res, 200, { issuer: base, authorization_endpoint: base + '/authorize', token_endpoint: base + '/token',
+      registration_endpoint: base + '/register', response_types_supported: ['code'], grant_types_supported: ['authorization_code', 'refresh_token'],
+      code_challenge_methods_supported: ['S256'], token_endpoint_auth_methods_supported: ['none', 'client_secret_post', 'client_secret_basic'],
+      scopes_supported: ['tv'] }), true;
+  if (p === '/register' && req.method === 'POST') {
+    const b = parseBody(await readBody(req), req.headers['content-type']);
+    return sendJson(res, 201, { client_id: rnd(), client_id_issued_at: Math.floor(Date.now() / 1000), client_name: b.client_name || 'claude',
+      redirect_uris: b.redirect_uris || [], grant_types: ['authorization_code', 'refresh_token'], response_types: ['code'],
+      token_endpoint_auth_method: 'none' }), true;
+  }
+  if (p === '/authorize' && req.method === 'GET') {
+    const q = new URL(req.url, base).searchParams, ru = q.get('redirect_uri') || '';
+    if (!OK_REDIRECT.test(ru)) { res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('redirect_uri not allowed'); return true; }
+    const code = rnd(); codes.set(code, { ch: q.get('code_challenge'), m: q.get('code_challenge_method') || 'plain', exp: Date.now() + 300000 });
+    const loc = new URL(ru); loc.searchParams.set('code', code); if (q.get('state')) loc.searchParams.set('state', q.get('state'));
+    res.writeHead(302, { Location: loc.toString() }); res.end(); return true;
+  }
+  if (p === '/token' && req.method === 'POST') {
+    const b = parseBody(await readBody(req), req.headers['content-type']);
+    if (b.grant_type === 'authorization_code') {
+      const c = codes.get(b.code); codes.delete(b.code);
+      if (!c || c.exp < Date.now()) return sendJson(res, 400, { error: 'invalid_grant' }), true;
+      if (c.ch) { const v = String(b.code_verifier || ''); const calc = c.m === 'S256' ? b64u(crypto.createHash('sha256').update(v).digest()) : v;
+        if (calc !== c.ch) return sendJson(res, 400, { error: 'invalid_grant', error_description: 'PKCE' }), true; }
+    } else if (b.grant_type !== 'refresh_token') return sendJson(res, 400, { error: 'unsupported_grant_type' }), true;
+    return sendJson(res, 200, { access_token: rnd(), token_type: 'Bearer', expires_in: 31536000, refresh_token: rnd(), scope: 'tv' }), true;
+  }
+  return false;
+}
+
 const reqLog = [];
-http.createServer((req, res) => {
+http.createServer(async (req, res) => {
   const t0 = Date.now(), masked = String(req.url).split(TOKEN).join('***');
   let rpc = '';
   res.on('finish', () => {
@@ -165,7 +210,11 @@ http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end(reqLog.slice(-80).join('\n') + '\n'); }
   const byPath = parts.length === 2 && parts[0] === TOKEN && parts[1] === 'mcp';
   const byHeader = parts.length === 1 && parts[0] === 'mcp' && req.headers.authorization === 'Bearer ' + TOKEN;
-  if (!byPath && !byHeader) { res.writeHead(404); return res.end(); }
+  if (!byPath && !byHeader) {
+    const base = 'https://' + String(req.headers['x-forwarded-host'] || req.headers.host || 'localhost');
+    try { if (await oauth(req, res, parts, base)) return; } catch (e) { log('oauth ERR', e.message); }
+    res.writeHead(404); return res.end();
+  }
   if (req.method === 'DELETE') { res.writeHead(204); return res.end(); }
   if (req.method !== 'POST') { res.writeHead(405, { Allow: 'POST' }); return res.end(); }
   let body = '';

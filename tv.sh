@@ -6,7 +6,7 @@ B=https://raw.githubusercontent.com/povarenock141-png/plugins/tv-hub
 mkdir -p $PREFIX/etc/apt/apt.conf.d
 printf 'Dpkg::Options {"--force-confdef";"--force-confold";};\nAPT::Get::Assume-Yes "true";\n' > $PREFIX/etc/apt/apt.conf.d/99tvhub
 echo "== packages =="
-pkg install -y android-tools nodejs cloudflared imagemagick procps || { echo "PKG FAILED"; exit 1; }
+pkg install -y android-tools nodejs cloudflared procps || { echo "PKG FAILED"; exit 1; }
 echo "== files =="
 mkdir -p ~/tvhub && cd ~/tvhub
 echo "$T" > token

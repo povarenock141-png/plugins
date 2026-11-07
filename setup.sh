@@ -46,6 +46,35 @@ const KEYS = { home: 'HOME', back: 'BACK', up: 'DPAD_UP', down: 'DPAD_DOWN', lef
 const PKG = /^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$/;
 const txt = t => ({ content: [{ type: 'text', text: String(t).trim() || 'OK' }] });
 
+let magick = null;
+const hasMagick = async () => magick !== null ? magick : (magick = !(await exec('magick', ['-version'])).err);
+const zlib = require('zlib');
+const CRC = new Int32Array(256).map((_, n) => { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c; });
+const crc32 = b => { let c = -1; for (const x of b) c = CRC[(c ^ x) & 255] ^ (c >>> 8); return (c ^ -1) >>> 0; };
+const chunk = (type, data) => { const t = Buffer.from(type), l = Buffer.alloc(4), c = Buffer.alloc(4);
+  l.writeUInt32BE(data.length); c.writeUInt32BE(crc32(Buffer.concat([t, data]))); return Buffer.concat([l, t, data, c]); };
+// Сырой кадр screencap (без -p) -> уменьшенный PNG. Без внешних программ; мусор Hisense перед заголовком пропускается.
+function rawShotPng(raw) {
+  let o = -1, w = 0, h = 0, hl = 0, f = 1;
+  for (let i = 0; i <= Math.min(2048, raw.length - 16) && o < 0; i++) {
+    const W = raw.readUInt32LE(i), H = raw.readUInt32LE(i + 4), F = raw.readUInt32LE(i + 8);
+    if (W < 16 || W > 8192 || H < 16 || H > 8192 || F < 1 || F > 5) continue;
+    for (const L of [12, 16]) if (raw.length - i === L + W * H * 4) { o = i; w = W; h = H; hl = L; f = F; break; }
+  }
+  if (o < 0) throw new Error('не удалось разобрать снимок ТВ');
+  const px = raw.subarray(o + hl), s = Math.max(1, Math.ceil(w / 1280)), W2 = Math.floor(w / s), H2 = Math.floor(h / s);
+  const [ri, bi] = f === 5 ? [2, 0] : [0, 2], row = 1 + W2 * 3, out = Buffer.alloc(row * H2), n = s * s;
+  for (let y = 0; y < H2; y++) for (let x = 0; x < W2; x++) {
+    let r = 0, g = 0, b = 0;
+    for (let dy = 0; dy < s; dy++) for (let dx = 0; dx < s; dx++) {
+      const p = ((y * s + dy) * w + x * s + dx) * 4; r += px[p + ri]; g += px[p + 1]; b += px[p + bi]; }
+    const q = y * row + 1 + x * 3; out[q] = r / n; out[q + 1] = g / n; out[q + 2] = b / n;
+  }
+  const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(W2, 0); ihdr.writeUInt32BE(H2, 4); ihdr.set([8, 2, 0, 0, 0], 8);
+  return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr),
+    chunk('IDAT', zlib.deflateSync(out, { level: 9 })), chunk('IEND', Buffer.alloc(0))]);
+}
+
 const TOOLS = [
   { name: 'tv_key', description: 'Нажать кнопку пульта ТВ. Кнопки выключения нет намеренно: полное выключение роняет ТВ из сети.',
     inputSchema: { type: 'object', properties: { key: { type: 'string', enum: Object.keys(KEYS) },
@@ -82,17 +111,21 @@ const TOOLS = [
       return txt('ТВ ' + TV + ' на связи\n' + f + '\n' + p); } },
   { name: 'tv_screenshot', description: 'Снимок экрана ТВ. Видео с защитой (DRM) может выйти чёрным.',
     inputSchema: { type: 'object', properties: {} },
-    run: async () => { let png = await adb(['exec-out', 'screencap', '-p'], true);
-      const at = png ? png.indexOf(Buffer.from([0x89, 0x50, 0x4e, 0x47])) : -1; // Hisense пишет мусор перед PNG
-      if (at < 0) throw new Error('ТВ не отдал снимок');
-      png = png.subarray(at);
-      const tin = path.join(os.tmpdir(), 'tvshot.png'), tout = path.join(os.tmpdir(), 'tvshot.jpg');
-      fs.writeFileSync(tin, png);
-      for (const bin of ['magick', 'convert']) {
-        const r = await exec(bin, [tin, '-resize', '1280x1280>', '-quality', '70', tout]);
-        if (!r.err && fs.existsSync(tout)) return { content: [{ type: 'image', mimeType: 'image/jpeg', data: fs.readFileSync(tout).toString('base64') }] };
+    run: async () => {
+      if (await hasMagick()) {
+        let png = await adb(['exec-out', 'screencap', '-p'], true);
+        const at = png ? png.indexOf(Buffer.from([0x89, 0x50, 0x4e, 0x47])) : -1; // Hisense пишет мусор перед PNG
+        if (at >= 0) {
+          png = png.subarray(at);
+          const tin = path.join(os.tmpdir(), 'tvshot.png'), tout = path.join(os.tmpdir(), 'tvshot.jpg');
+          fs.writeFileSync(tin, png);
+          for (const bin of ['magick', 'convert']) {
+            const r = await exec(bin, [tin, '-resize', '1280x1280>', '-quality', '70', tout]);
+            if (!r.err && fs.existsSync(tout)) return { content: [{ type: 'image', mimeType: 'image/jpeg', data: fs.readFileSync(tout).toString('base64') }] };
+          }
+        }
       }
-      return { content: [{ type: 'image', mimeType: 'image/png', data: png.toString('base64') }] }; } },
+      return { content: [{ type: 'image', mimeType: 'image/png', data: rawShotPng(await adb(['exec-out', 'screencap'], true)).toString('base64') }] }; } },
 ];
 
 const INSTR = 'Управление телевизором Toshiba 65U7950 (Android TV 9) у Макса дома через ADB. ' +
@@ -106,7 +139,7 @@ async function handle(m) {
   const p = m.params || {};
   switch (m.method) {
     case 'initialize': return ok({ protocolVersion: typeof p.protocolVersion === 'string' ? p.protocolVersion : '2025-06-18',
-      capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'tv-hub', version: '1.0.1' }, instructions: INSTR });
+      capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'tv-hub', version: '1.1.0' }, instructions: INSTR });
     case 'ping': return ok({});
     case 'tools/list': return ok({ tools: TOOLS.map(({ run, ...t }) => t) });
     case 'tools/call': {
